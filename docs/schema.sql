@@ -83,6 +83,39 @@ CREATE TABLE login_events (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Added by backend/src/mitigations/003_add_hr_finance_tables.sql (Backend
+-- Dev 3, hr.routes.js / finance.routes.js). See that file for the full
+-- rationale, in particular why these routes gate on the existing
+-- view_hr_dashboard / view_finance_dashboard permissions rather than new
+-- manage_* ones.
+CREATE TABLE employees (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    email VARCHAR(150) UNIQUE NOT NULL,
+    department VARCHAR(50),
+    roles TEXT[] NOT NULL DEFAULT '{}',
+    status VARCHAR(20) NOT NULL DEFAULT 'active', -- 'active' | 'inactive'
+    joined_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE budgets (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(100) UNIQUE NOT NULL,
+    allocated NUMERIC(12,2) NOT NULL DEFAULT 0,
+    spent NUMERIC(12,2) NOT NULL DEFAULT 0 -- maintained by finance.routes.js on expense approval
+);
+
+CREATE TABLE expenses (
+    id SERIAL PRIMARY KEY,
+    category VARCHAR(100) NOT NULL,
+    description TEXT,
+    amount NUMERIC(12,2) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending', -- 'pending' | 'approved' | 'rejected'
+    submitted_by INTEGER REFERENCES users(id),
+    submitted_at TIMESTAMP DEFAULT NOW(),
+    reviewed_at TIMESTAMP
+);
+
 -- Seed a few starter roles/permissions so everyone has the same base data
 INSERT INTO roles (name, description) VALUES
     ('admin', 'Full system access'),
@@ -222,3 +255,15 @@ FROM users WHERE email = 'priya.finance@nexagen.com';
 INSERT INTO audit_logs (user_id, action, resource, ip_address, created_at)
 SELECT id, 'ACCESS_DENIED', 'manage_users', '10.0.0.5', NOW() - INTERVAL '1 days'
 FROM users WHERE email = 'rahul.hr@nexagen.com';
+
+-- --------------------------------------------------------------------------
+-- Starter budget categories so the Finance dashboard's expense-submission
+-- dropdown isn't empty on first load. Matched by category name, safe to
+-- re-run. See backend/src/mitigations/003_add_hr_finance_tables.sql.
+-- --------------------------------------------------------------------------
+INSERT INTO budgets (category, allocated, spent) VALUES
+    ('Travel', 20000, 6400),
+    ('Equipment', 15000, 9800),
+    ('Marketing', 25000, 11200),
+    ('Operations', 30000, 18750)
+ON CONFLICT (category) DO NOTHING;
