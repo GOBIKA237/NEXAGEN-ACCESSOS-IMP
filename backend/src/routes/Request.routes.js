@@ -55,8 +55,15 @@ router.post('/access-requests', requireAuth, async (req, res) => {
   }
 });
 
-// GET /admin/access-requests?status=pending
+// GET /admin/access-requests?status=PENDING_ADMIN
 // requireAuth + checkPermission('manage_users')
+//
+// `status` is matched case-sensitively against the real enum stored in
+// access_requests.status: PENDING_MANAGER | PENDING_ADMIN | APPROVED |
+// REJECTED | REVOKED (see docs/schema.sql). The admin "pending" queue is
+// specifically PENDING_ADMIN — a request only reaches this stage after a
+// manager has approved it (see manager.routes.js). client.js's
+// getAccessRequests() calls this with ?status=PENDING_ADMIN.
 router.get(
   '/admin/access-requests',
   requireAuth,
@@ -129,6 +136,19 @@ router.get(
 // PUT /admin/access-requests/:id
 // Body: { status: 'approved' | 'denied' }
 // requireAuth + checkPermission('manage_users')
+//
+// Only a request currently sitting at PENDING_ADMIN (i.e. already approved
+// by its manager) can be reviewed here — matches the real status enum
+// instead of the old non-existent 'pending' value. The stored result is
+// written back in the same uppercase enum as every other stage
+// (PENDING_MANAGER/PENDING_ADMIN/APPROVED/REJECTED/REVOKED) rather than
+// the raw lowercase request-body value, so it stays consistent with what
+// accessRequestsMe.routes.js and Dashboard.jsx's STATUS_LABELS expect.
+const ADMIN_DECISION_STATUS = {
+  approved: 'APPROVED',
+  denied: 'REJECTED',
+};
+
 router.put(
   '/admin/access-requests/:id',
   requireAuth,
@@ -137,7 +157,8 @@ router.put(
     const { id } = req.params;
     const { status } = req.body;
 
-    if (!['approved', 'denied'].includes(status)) {
+    const newStatus = ADMIN_DECISION_STATUS[status];
+    if (!newStatus) {
       return res.status(400).json({ error: "status must be 'approved' or 'denied'" });
     }
 
@@ -149,9 +170,9 @@ router.put(
       const updateResult = await client.query(
         `UPDATE access_requests
          SET status = $1, reviewed_by = $2, reviewed_at = NOW()
-         WHERE id = $3 AND status = 'pending'
+         WHERE id = $3 AND status = 'PENDING_ADMIN'
          RETURNING id, user_id, requested_role_id, status`,
-        [status, req.user.id, id]
+        [newStatus, req.user.id, id]
       );
 
       if (updateResult.rows.length === 0) {
@@ -163,7 +184,7 @@ router.put(
 
       const request = updateResult.rows[0];
 
-      if (status === 'approved') {
+      if (newStatus === 'APPROVED') {
         await client.query(
           `INSERT INTO user_roles (user_id, role_id)
            VALUES ($1, $2)
