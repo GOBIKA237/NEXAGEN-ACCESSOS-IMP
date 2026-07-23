@@ -86,7 +86,7 @@ router.put('/access-requests/:id', requireAuth, requireRole('manager'), async (r
 
   try {
     const { rows: existingRows } = await pool.query(
-      'SELECT id, manager_id, status FROM access_requests WHERE id = $1',
+      'SELECT id, manager_id, status, user_id, requested_role_id FROM access_requests WHERE id = $1',
       [id]
     );
 
@@ -117,15 +117,32 @@ router.put('/access-requests/:id', requireAuth, requireRole('manager'), async (r
       [newStatus, comment ?? null, id]
     );
 
+    // Pull the requester's name + the role they asked for so the audit log
+    // shows a human-readable "who/what" instead of just the raw
+    // access_request id.
+    const { rows: contextRows } = await pool.query(
+      `SELECT u.name AS user_name, r.name AS role_name
+       FROM users u, roles r
+       WHERE u.id = $1 AND r.id = $2`,
+      [existing.user_id, existing.requested_role_id]
+    );
+    const requesterName = contextRows[0]?.user_name ?? `user:${existing.user_id}`;
+    const roleName = contextRows[0]?.role_name ?? `role:${existing.requested_role_id}`;
+
     // CLAUDE.md: "Every permission check and admin action gets written to
     // audit_logs" — this is a manager decision, same convention.
+    //
+    // user_id is the actor (this manager); target_user_id is the requester
+    // the decision was about — see Request.routes.js's GET
+    // /admin/audit-logs, which shows target_user_id as the row's "user".
     await pool.query(
-      `INSERT INTO audit_logs (user_id, action, resource, ip_address)
-       VALUES ($1, $2, $3, $4)`,
+      `INSERT INTO audit_logs (user_id, target_user_id, action, resource, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
       [
         req.user.id,
+        existing.user_id,
         decision === 'approved' ? 'MANAGER_APPROVED_REQUEST' : 'MANAGER_REJECTED_REQUEST',
-        `access_request:${id}`,
+        `access_request:${id} — ${requesterName} (${roleName})`,
         req.ip,
       ]
     );
