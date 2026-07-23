@@ -37,11 +37,10 @@ async function deleteRole(id) {
   await api.delete(`/admin/roles/${id}`);
 }
 
-// `confirm: true` is this frontend's assumption for how to re-submit after
-// a 409 conflict — the backend's PUT /users/:id/roles doesn't currently
-// read any such flag (it always re-runs the same overlap check), so a
-// confirmed retry will 409 again until Backend Dev 2 adds a bypass. Flagged
-// in the PR description; see chat writeup.
+// `confirm: true` on a retry after a 409 conflict skips the overlap check
+// server-side (see PUT /users/:id/roles in rbac.routes.js) and applies the
+// roles anyway. Verified working end-to-end as of Backend Dev 2's latest
+// changes — a confirmed retry now returns 200 instead of 409 again.
 async function updateUserRoles(id, roleIds, { confirm } = {}) {
   const { data } = await api.put(`/admin/users/${id}/roles`, {
     roleIds,
