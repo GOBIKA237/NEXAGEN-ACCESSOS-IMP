@@ -13,7 +13,23 @@ const router = Router();
 const CONFLICT_WATCHLIST_PERMISSIONS = ['manage_users'];
 
 router.get('/users', requireAuth, checkPermission('manage_users'), async (req, res) => {
-  const { rows } = await pool.query('SELECT id, name, email FROM users');
+  // Same json_agg + LEFT JOIN pattern as GET /roles/predefined below.
+  // docs/api-contract.md and the frontend's userRoleNames() (AdminDashboard.jsx)
+  // both expect `roles` as an array of role name strings — not role objects,
+  // and not omitted for users with zero roles (COALESCE gives them `[]`
+  // instead of NULL from json_agg over an empty LEFT JOIN).
+  const { rows } = await pool.query(
+    `SELECT u.id, u.name, u.email,
+            COALESCE(
+              json_agg(r.name) FILTER (WHERE r.name IS NOT NULL),
+              '[]'
+            ) AS roles
+     FROM users u
+     LEFT JOIN user_roles ur ON ur.user_id = u.id
+     LEFT JOIN roles r ON r.id = ur.role_id
+     GROUP BY u.id
+     ORDER BY u.id`
+  );
   res.json(rows);
 });
 
