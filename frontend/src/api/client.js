@@ -126,13 +126,18 @@ export async function getAvailableRoles() {
 // ACCESS REQUESTS
 // =========================
 
+// Admin's pending queue. access_requests.status is a case-sensitive enum
+// (PENDING_MANAGER | PENDING_ADMIN | APPROVED | REJECTED | REVOKED — see
+// docs/schema.sql). A request only reaches the admin stage — and only
+// belongs in this list — once its manager has approved it and moved it to
+// PENDING_ADMIN (see manager.routes.js). There is no 'pending' status.
 export async function getAccessRequests() {
   if (USE_MOCK) {
     return mock.mockAccessRequests;
   }
 
   const { data } = await api.get(
-    '/admin/access-requests?status=pending'
+    '/admin/access-requests?status=PENDING_ADMIN'
   );
 
   return data;
