@@ -9,6 +9,8 @@ import requestRoutes from './routes/Request.routes.js';
 import alertsRoutes from './routes/alerts.routes.js';
 import accessRequestsMeRoutes from './routes/accessRequestsMe.routes.js';
 import managerRoutes from './routes/manager.routes.js';
+import hrRoutes from './routes/hr.routes.js';
+import financeRoutes from './routes/finance.routes.js';
 
 dotenv.config();
 
@@ -53,6 +55,15 @@ app.use('/api/access-requests', accessRequestsMeRoutes);
 // Manager dashboard — GET /api/manager/team, GET /api/manager/access-requests,
 // PUT /api/manager/access-requests/:id. See routes/manager.routes.js.
 app.use('/api/manager', managerRoutes);
+
+// HR / Finance dashboards — Backend Dev 3. GET/POST /api/hr/employees,
+// PUT /api/hr/employees/:id/status (hr.routes.js); GET /api/finance/budgets,
+// GET/POST /api/finance/expenses, PUT /api/finance/expenses/:id, GET
+// /api/finance/reports (finance.routes.js). Paths inside those two files
+// are relative ('/employees', '/budgets', ...) — same double-prefix bug
+// alerts.routes.js hit and fixed applies here if that ever changes.
+app.use('/api/hr', hrRoutes);
+app.use('/api/finance', financeRoutes);
 
 const PORT = process.env.PORT || 5000;
 
