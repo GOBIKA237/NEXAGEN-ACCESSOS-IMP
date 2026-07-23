@@ -30,6 +30,67 @@ const MIN_PASSWORD_LENGTH = 8;
 const LOCKOUT_THRESHOLD = parseInt(process.env.LOGIN_LOCKOUT_THRESHOLD, 10) || 5;
 const LOCKOUT_WINDOW_MINUTES = parseInt(process.env.LOGIN_LOCKOUT_WINDOW_MINUTES, 10) || 15;
 
+// --- Geolocation enrichment --------------------------------------------------
+//
+// Best-effort only. ip-api.com's free tier is plain HTTP, has no auth, and
+// returns { status: 'fail' } (not an HTTP error) for private/reserved IP
+// ranges — which covers virtually all of the demo/dev data (10.0.0.x,
+// 127.0.0.1, ::1, etc.), so a "fail" there is expected and not logged as an
+// error. A short timeout + try/catch around the whole thing means a slow or
+// unreachable ip-api.com can never delay or block a login; on any failure
+// this just leaves login_events.geo_lat/geo_lon/geo_city NULL for the row,
+// which rulesEngine.js's checkImpossibleTravel() and explainRiskSignals()
+// already treat as "nothing to compare, skip the signal".
+const GEO_LOOKUP_TIMEOUT_MS = 2000;
+
+async function fetchGeoLocation(ipAddress) {
+  if (!ipAddress) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEO_LOOKUP_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(
+      `http://ip-api.com/json/${encodeURIComponent(ipAddress)}?fields=status,message,lat,lon,city`,
+      { signal: controller.signal }
+    );
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    // status is 'fail' (with a message like 'private range' or 'invalid query')
+    // rather than a non-2xx HTTP status, so check it explicitly.
+    if (data.status !== 'success') return null;
+
+    return { lat: data.lat, lon: data.lon, city: data.city };
+  } catch (err) {
+    // Covers network errors and the AbortController timeout firing.
+    console.error('Geo lookup failed:', err.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Looks up geo data for ipAddress and, if found, writes it onto the given
+// login_events row. Returns the geo data (for immediate use in scoring) or
+// null if the lookup didn't resolve.
+async function enrichLoginGeo(loginEventId, ipAddress) {
+  const geo = await fetchGeoLocation(ipAddress);
+  if (!geo) return null;
+
+  try {
+    await pool.query(
+      `UPDATE login_events SET geo_lat = $1, geo_lon = $2, geo_city = $3 WHERE id = $4`,
+      [geo.lat, geo.lon, geo.city, loginEventId]
+    );
+  } catch (err) {
+    console.error('Failed to persist login geo data:', err);
+    return null;
+  }
+
+  return geo;
+}
+
 // Returns { locked: false } or { locked: true, retryAfterSeconds }.
 async function getLockoutStatus(userId) {
   const { rows } = await pool.query(
@@ -149,17 +210,37 @@ router.post('/login', async (req, res) => {
     const { rows: eventRows } = await pool.query(
       `INSERT INTO login_events (user_id, success, ip_address, device_fingerprint, risk_score)
        VALUES ($1, $2, $3, $4, 0)
-       RETURNING id`,
+       RETURNING id, created_at`,
       [user.id, match, ipAddress, deviceFingerprint]
     );
     const loginEventId = eventRows[0].id;
+    const loginCreatedAt = eventRows[0].created_at;
+
+    // Best-effort only — never blocks or delays the login response either
+    // way. See enrichLoginGeo() above for what happens on failure.
+    const geo = await enrichLoginGeo(loginEventId, ipAddress);
 
     if (!match) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Score this login and update the row just inserted.
-    const riskScore = await scoreLogin({ userId: user.id, deviceFingerprint });
+    // Score this login and update the row just inserted. loginEvent is only
+    // passed when the geo lookup actually resolved, so scoreLogin's
+    // impossible-travel check has real coordinates to compare — it treats a
+    // missing/omitted loginEvent as "nothing to check" rather than an error.
+    const riskScore = await scoreLogin({
+      userId: user.id,
+      deviceFingerprint,
+      loginEvent: geo
+        ? {
+            id: loginEventId,
+            geoLat: geo.lat,
+            geoLon: geo.lon,
+            geoCity: geo.city,
+            createdAt: loginCreatedAt,
+          }
+        : null,
+    });
     await pool.query(
       `UPDATE login_events SET risk_score = $1 WHERE id = $2`,
       [riskScore, loginEventId]
