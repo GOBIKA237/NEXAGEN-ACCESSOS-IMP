@@ -118,10 +118,15 @@ router.post(
 
       // Same pattern checkPermission uses: record the admin action so it
       // shows up in the audit log / feeds the rules engine.
+      //
+      // user_id is the actor (the admin who invalidated the session);
+      // target_user_id is the user whose session it was — see
+      // Request.routes.js's GET /admin/audit-logs, which shows
+      // target_user_id as the row's "user".
       await pool.query(
-        `INSERT INTO audit_logs (user_id, action, resource, ip_address)
-         VALUES ($1, $2, $3, $4)`,
-        [req.user.id, 'SESSION_INVALIDATED', `user:${targetUserId}`, req.ip]
+        `INSERT INTO audit_logs (user_id, target_user_id, action, resource, ip_address)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [req.user.id, targetUserId, 'SESSION_INVALIDATED', `user:${targetUserId}`, req.ip]
       );
 
       return res.json({
