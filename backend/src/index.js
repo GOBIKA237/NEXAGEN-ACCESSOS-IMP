@@ -8,6 +8,7 @@ import rbacRoutes from './routes/rbac.routes.js';
 import requestRoutes from './routes/Request.routes.js';
 import alertsRoutes from './routes/alerts.routes.js';
 import accessRequestsMeRoutes from './routes/accessRequestsMe.routes.js';
+import managerRoutes from './routes/manager.routes.js';
 
 dotenv.config();
 
@@ -48,6 +49,10 @@ app.use('/api', requestRoutes);
 // Deliberately its own router/mount (see routes/accessRequestsMe.routes.js)
 // rather than folded into requestRoutes above, which is owned by Backend Dev 2.
 app.use('/api/access-requests', accessRequestsMeRoutes);
+
+// Manager dashboard — GET /api/manager/team, GET /api/manager/access-requests,
+// PUT /api/manager/access-requests/:id. See routes/manager.routes.js.
+app.use('/api/manager', managerRoutes);
 
 const PORT = process.env.PORT || 5000;
 
