@@ -31,11 +31,21 @@ router.post('/access-requests', requireAuth, async (req, res) => {
   }
 
   try {
+    // manager_id is a snapshot of the requester's manager at request time
+    // (docs/schema.sql), not a live lookup on review — if the requester's
+    // manager changes later, this request stays with whoever it was
+    // assigned to when submitted.
+    const { rows: userRows } = await pool.query(
+      'SELECT manager_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const managerId = userRows[0]?.manager_id ?? null;
+
     const result = await pool.query(
-      `INSERT INTO access_requests (user_id, requested_role_id, status)
-       VALUES ($1, $2, 'pending')
-       RETURNING id, user_id, requested_role_id, status, requested_at`,
-      [req.user.id, requestedRoleId]
+      `INSERT INTO access_requests (user_id, requested_role_id, status, manager_id)
+       VALUES ($1, $2, 'PENDING_MANAGER', $3)
+       RETURNING id, user_id, requested_role_id, status, requested_at, manager_id`,
+      [req.user.id, requestedRoleId, managerId]
     );
 
     return res.status(201).json(result.rows[0]);
