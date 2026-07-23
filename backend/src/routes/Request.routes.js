@@ -55,15 +55,26 @@ router.post('/access-requests', requireAuth, async (req, res) => {
   }
 });
 
-// GET /admin/access-requests?status=PENDING_ADMIN
+// GET /admin/access-requests?status=PENDING
 // requireAuth + checkPermission('manage_users')
 //
-// `status` is matched case-sensitively against the real enum stored in
-// access_requests.status: PENDING_MANAGER | PENDING_ADMIN | APPROVED |
-// REJECTED | REVOKED (see docs/schema.sql). The admin "pending" queue is
-// specifically PENDING_ADMIN — a request only reaches this stage after a
-// manager has approved it (see manager.routes.js). client.js's
-// getAccessRequests() calls this with ?status=PENDING_ADMIN.
+// `status` is matched against the real enum stored in access_requests.status:
+// PENDING_MANAGER | PENDING_ADMIN | APPROVED | REJECTED | REVOKED (see
+// docs/schema.sql).
+//
+// ADMIN VISIBILITY: there is currently no UI/route for assigning a manager
+// to a user, so every request lands with manager_id = NULL and would sit at
+// PENDING_MANAGER forever if Admin only ever looked at PENDING_ADMIN — that
+// was the bug reported (submitted requests never showed up for Admin).
+// Admin needs to be able to see and decide on a request regardless of
+// whether it's picked up a manager decision yet, so `status=PENDING` is an
+// alias covering BOTH not-yet-finalized stages (PENDING_MANAGER and
+// PENDING_ADMIN). Any other value passed is matched exactly (e.g. for a
+// future "history" view over APPROVED/REJECTED/REVOKED). No `status` at all
+// still returns everything, same as before.
+// client.js's getAccessRequests() calls this with ?status=PENDING.
+const ADMIN_QUEUE_ALIAS = { PENDING: ['PENDING_MANAGER', 'PENDING_ADMIN'] };
+
 router.get(
   '/admin/access-requests',
   requireAuth,
@@ -74,7 +85,10 @@ router.get(
     try {
       const params = [];
       let where = '';
-      if (status) {
+      if (status && ADMIN_QUEUE_ALIAS[status]) {
+        params.push(ADMIN_QUEUE_ALIAS[status]);
+        where = `WHERE ar.status = ANY($${params.length}::text[])`;
+      } else if (status) {
         params.push(status);
         where = `WHERE ar.status = $${params.length}`;
       }
@@ -137,10 +151,17 @@ router.get(
 // Body: { status: 'approved' | 'denied' }
 // requireAuth + checkPermission('manage_users')
 //
-// Only a request currently sitting at PENDING_ADMIN (i.e. already approved
-// by its manager) can be reviewed here — matches the real status enum
-// instead of the old non-existent 'pending' value. The stored result is
-// written back in the same uppercase enum as every other stage
+// Admin can decide a request from EITHER PENDING_MANAGER or PENDING_ADMIN —
+// not just PENDING_ADMIN. There's currently no way to assign a manager to a
+// user, so every request would otherwise sit at PENDING_MANAGER forever
+// with nobody able to act on it. This makes Admin the always-available
+// final authority: if a manager gets assigned later and reviews first, the
+// request naturally arrives here already at PENDING_ADMIN (unchanged
+// behavior); if not, Admin can still act on it directly from
+// PENDING_MANAGER (an implicit skip-level override). Either starting status
+// still requires it to be a non-terminal request — APPROVED/REJECTED/
+// REVOKED can't be re-decided. The stored result is written back in the
+// same uppercase enum as every other stage
 // (PENDING_MANAGER/PENDING_ADMIN/APPROVED/REJECTED/REVOKED) rather than
 // the raw lowercase request-body value, so it stays consistent with what
 // accessRequestsMe.routes.js and Dashboard.jsx's STATUS_LABELS expect.
@@ -170,7 +191,7 @@ router.put(
       const updateResult = await client.query(
         `UPDATE access_requests
          SET status = $1, reviewed_by = $2, reviewed_at = NOW()
-         WHERE id = $3 AND status = 'PENDING_ADMIN'
+         WHERE id = $3 AND status IN ('PENDING_MANAGER', 'PENDING_ADMIN')
          RETURNING id, user_id, requested_role_id, status`,
         [newStatus, req.user.id, id]
       );
@@ -192,6 +213,40 @@ router.put(
           [request.user_id, request.requested_role_id]
         );
       }
+
+      // Pull the requester's name + the role they asked for so the audit
+      // log shows a human-readable "who/what" instead of just the raw
+      // access_request id (which meant nothing without cross-referencing
+      // the access_requests table by hand).
+      const { rows: contextRows } = await client.query(
+        `SELECT u.name AS user_name, r.name AS role_name
+         FROM users u, roles r
+         WHERE u.id = $1 AND r.id = $2`,
+        [request.user_id, request.requested_role_id]
+      );
+      const requesterName = contextRows[0]?.user_name ?? `user:${request.user_id}`;
+      const roleName = contextRows[0]?.role_name ?? `role:${request.requested_role_id}`;
+
+      // CLAUDE.md: "Every permission check and admin action gets written to
+      // audit_logs" — this route was missing it (manager.routes.js's
+      // equivalent decision already logs its own).
+      //
+      // user_id stays the actor (the admin who made the call);
+      // target_user_id is the requester the decision was actually about.
+      // GET /admin/audit-logs below shows target_user_id as the row's
+      // "user" when present, so the log reads as "who it happened to"
+      // rather than "who clicked the button."
+      await client.query(
+        `INSERT INTO audit_logs (user_id, target_user_id, action, resource, ip_address)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          req.user.id,
+          request.user_id,
+          newStatus === 'APPROVED' ? 'ADMIN_APPROVED_REQUEST' : 'ADMIN_REJECTED_REQUEST',
+          `access_request:${id} — ${requesterName} (${roleName})`,
+          req.ip,
+        ]
+      );
 
       await client.query('COMMIT');
       return res.json(request);
@@ -222,20 +277,47 @@ router.get(
       let where = '';
       if (userId) {
         params.push(userId);
-        where = `WHERE user_id = $${params.length}`;
+        where = `WHERE al.user_id = $${params.length}`;
       }
       params.push(limit, offset);
 
       const result = await pool.query(
-        `SELECT id, user_id, action, resource, ip_address, device_info, created_at
-         FROM audit_logs
+        `SELECT al.id, al.action, al.resource, al.ip_address, al.device_info, al.created_at,
+                actor.id AS actor_id, actor.name AS actor_name, actor.email AS actor_email,
+                target.id AS target_id, target.name AS target_name, target.email AS target_email
+         FROM audit_logs al
+         LEFT JOIN users actor  ON actor.id  = al.user_id
+         LEFT JOIN users target ON target.id = al.target_user_id
          ${where}
-         ORDER BY created_at DESC
+         ORDER BY al.created_at DESC
          LIMIT $${params.length - 1} OFFSET $${params.length}`,
         params
       );
 
-      return res.json(result.rows);
+      // "user" is whoever the row is ABOUT: the target when this action was
+      // performed on someone else (approvals/rejections/session actions),
+      // falling back to the actor for self-actions (ACCESS_GRANTED, etc.)
+      // where there's no separate target. performedBy always stays the
+      // actor, so who-did-it is never lost even though the UI only shows
+      // one name column today — see AdminDashboard.jsx's auditUserName().
+      const shaped = result.rows.map((row) => ({
+        id: row.id,
+        user: row.target_id
+          ? { id: row.target_id, name: row.target_name, email: row.target_email }
+          : row.actor_id
+          ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+          : null,
+        performedBy: row.actor_id
+          ? { id: row.actor_id, name: row.actor_name, email: row.actor_email }
+          : null,
+        action: row.action,
+        resource: row.resource,
+        ipAddress: row.ip_address,
+        deviceInfo: row.device_info,
+        createdAt: row.created_at,
+      }));
+
+      return res.json(shaped);
     } catch (err) {
       console.error('Error fetching audit logs:', err);
       return res.status(500).json({ error: 'Failed to fetch audit logs' });
