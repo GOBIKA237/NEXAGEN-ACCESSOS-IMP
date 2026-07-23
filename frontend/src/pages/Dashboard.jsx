@@ -82,8 +82,20 @@ function DecisionCell({ decision }) {
     return <span className="text-xs italic text-slate-400">Awaiting review</span>;
   }
 
-  const tone = decision.decision === 'APPROVED' ? 'green' : 'red';
-  const label = decision.decision === 'APPROVED' ? 'Approved' : 'Rejected';
+  // adminDecision.decision can be APPROVED | REJECTED | REVOKED (see
+  // accessRequestsMe.routes.js); managerDecision.decision is only ever
+  // APPROVED | REJECTED. Handle all three explicitly rather than
+  // defaulting anything non-APPROVED to "Rejected", which mislabeled a
+  // revoke as a rejection.
+  const DECISION_STYLES = {
+    APPROVED: { tone: 'green', label: 'Approved' },
+    REJECTED: { tone: 'red', label: 'Rejected' },
+    REVOKED: { tone: 'slate', label: 'Revoked' },
+  };
+  const { tone, label } = DECISION_STYLES[decision.decision] ?? {
+    tone: 'slate',
+    label: decision.decision,
+  };
 
   return (
     <div>
