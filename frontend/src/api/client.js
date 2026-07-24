@@ -128,17 +128,17 @@ export async function getAvailableRoles() {
 
 // Admin's pending queue. access_requests.status is a case-sensitive enum
 // (PENDING_MANAGER | PENDING_ADMIN | APPROVED | REJECTED | REVOKED — see
-// docs/schema.sql). A request only reaches the admin stage — and only
-// belongs in this list — once its manager has approved it and moved it to
-// PENDING_ADMIN (see manager.routes.js). There is no 'pending' status.
+// docs/schema.sql). `status=PENDING` is a backend alias covering BOTH
+// non-terminal stages (PENDING_MANAGER and PENDING_ADMIN) — see
+// Request.routes.js. Admin can act on a request at either stage: there's
+// currently no way to assign a manager to a user, so most requests would
+// otherwise never leave PENDING_MANAGER and would never show up here.
 export async function getAccessRequests() {
   if (USE_MOCK) {
     return mock.mockAccessRequests;
   }
 
-  const { data } = await api.get(
-    '/admin/access-requests?status=PENDING_ADMIN'
-  );
+  const { data } = await api.get('/admin/access-requests?status=PENDING');
 
   return data;
 }
@@ -147,16 +147,22 @@ export async function getAccessRequests() {
 // REQUEST ACCESS (user-facing)
 // =========================
 
-export async function requestAccess(roleId) {
+// durationHours: 4 | 24 | 168 | null (null = permanent). Optional — Request
+// routes.js already treats undefined/null identically, both mean
+// permanent, so it's safe to always send the key rather than conditionally
+// including it.
+export async function requestAccess(roleId, durationHours = null) {
   if (USE_MOCK) {
     return {
       id: Date.now(),
       status: 'pending',
+      durationHours,
     };
   }
 
   const { data } = await api.post('/access-requests', {
     requestedRoleId: roleId,
+    durationHours,
   });
 
   return data;
