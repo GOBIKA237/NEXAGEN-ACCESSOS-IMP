@@ -267,6 +267,23 @@ export async function denyRequest(id) {
 }
 
 // =========================
+// REVOKE ACCESS REQUEST EARLY
+// =========================
+
+export async function revokeRequest(id) {
+  if (USE_MOCK) {
+    return {
+      id,
+      status: 'REVOKED',
+    };
+  }
+
+  const { data } = await api.post(`/admin/access-requests/${id}/revoke`);
+
+  return data;
+}
+
+// =========================
 // HR DASHBOARD (Frontend Dev 3)
 // =========================
 // Backend: hr.routes.js — GET/POST /api/hr/employees, PUT
