@@ -9,6 +9,8 @@ import requestRoutes from './routes/Request.routes.js';
 import alertsRoutes from './routes/alerts.routes.js';
 import accessRequestsMeRoutes from './routes/accessRequestsMe.routes.js';
 import managerRoutes from './routes/manager.routes.js';
+import leaveRoutes from './routes/leave.routes.js';
+import taskRoutes from './routes/task.routes.js';
 import hrRoutes from './routes/hr.routes.js';
 import financeRoutes from './routes/finance.routes.js';
 
@@ -52,9 +54,21 @@ app.use('/api', requestRoutes);
 // rather than folded into requestRoutes above, which is owned by Backend Dev 2.
 app.use('/api/access-requests', accessRequestsMeRoutes);
 
+// Leave requests — POST /api/leave-requests, GET /api/leave-requests/me.
+// Mounted at /api (routes/leave.routes.js uses relative, unprefixed paths)
+// so the final paths stay /api/leave-requests... rather than nesting under
+// another prefix. The manager-side GET/PUT /api/manager/leave-requests...
+// live in manager.routes.js and ride along with the existing
+// /api/manager mount below.
+app.use('/api', leaveRoutes);
+
 // Manager dashboard — GET /api/manager/team, GET /api/manager/access-requests,
 // PUT /api/manager/access-requests/:id. See routes/manager.routes.js.
 app.use('/api/manager', managerRoutes);
+
+// Task management — POST /api/tasks, GET /api/tasks, GET /api/tasks/me,
+// PUT /api/tasks/:id/status. See routes/task.routes.js.
+app.use('/api/tasks', taskRoutes);
 
 // HR / Finance dashboards — Backend Dev 3. GET/POST /api/hr/employees,
 // PUT /api/hr/employees/:id/status (hr.routes.js); GET /api/finance/budgets,
