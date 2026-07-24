@@ -22,12 +22,30 @@ router.get('/roles', requireAuth, async (req, res) => {
 });
 
 // POST /access-requests
-// Any logged-in user. Body: { requestedRoleId }
+// Any logged-in user. Body: { requestedRoleId, durationHours? }
+//
+// durationHours is optional — e.g. 4 / 24 / 168 (one week). Omit it (or
+// pass null) for a permanent request, unchanged from before. It's only
+// the *ask* at this point: nothing is time-boxed yet, and it has no
+// effect until an admin approves the request (see the PUT
+// /admin/access-requests/:id handler below, which is what actually
+// stamps access_requests.expires_at / user_roles.expires_at from it).
 router.post('/access-requests', requireAuth, async (req, res) => {
-  const { requestedRoleId } = req.body;
+  const { requestedRoleId, durationHours } = req.body;
 
   if (!requestedRoleId) {
     return res.status(400).json({ error: 'requestedRoleId is required' });
+  }
+
+  let normalizedDurationHours = null;
+  if (durationHours !== undefined && durationHours !== null) {
+    const parsed = Number(durationHours);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      return res
+        .status(400)
+        .json({ error: 'durationHours must be a positive integer number of hours, or omitted for permanent access' });
+    }
+    normalizedDurationHours = parsed;
   }
 
   try {
@@ -42,10 +60,10 @@ router.post('/access-requests', requireAuth, async (req, res) => {
     const managerId = userRows[0]?.manager_id ?? null;
 
     const result = await pool.query(
-      `INSERT INTO access_requests (user_id, requested_role_id, status, manager_id)
-       VALUES ($1, $2, 'PENDING_MANAGER', $3)
-       RETURNING id, user_id, requested_role_id, status, requested_at, manager_id`,
-      [req.user.id, requestedRoleId, managerId]
+      `INSERT INTO access_requests (user_id, requested_role_id, status, manager_id, duration_hours)
+       VALUES ($1, $2, 'PENDING_MANAGER', $3, $4)
+       RETURNING id, user_id, requested_role_id, status, requested_at, manager_id, duration_hours, expires_at`,
+      [req.user.id, requestedRoleId, managerId, normalizedDurationHours]
     );
 
     return res.status(201).json(result.rows[0]);
@@ -99,6 +117,8 @@ router.get(
            ar.status,
            ar.requested_at,
            ar.reviewed_at,
+           ar.duration_hours,
+           ar.expires_at,
            u.id   AS user_id,
            u.email AS user_email,
            u.name  AS user_name,
@@ -125,6 +145,8 @@ router.get(
         status: row.status,
         requestedAt: row.requested_at,
         reviewedAt: row.reviewed_at,
+        durationHours: row.duration_hours,
+        expiresAt: row.expires_at,
         user: {
           id: row.user_id,
           email: row.user_email,
@@ -188,11 +210,24 @@ router.put(
     try {
       await client.query('BEGIN');
 
+      // expires_at is only ever set here, on APPROVED, and only when the
+      // original request carried a duration_hours (set at creation time in
+      // POST /access-requests). Denials/permanent requests leave it NULL —
+      // computing it inline in the UPDATE (rather than reading
+      // duration_hours back and doing a second write) keeps the "was this
+      // approved with a duration" decision and the timestamp write atomic.
       const updateResult = await client.query(
         `UPDATE access_requests
-         SET status = $1, reviewed_by = $2, reviewed_at = NOW()
+         SET status = $1,
+             reviewed_by = $2,
+             reviewed_at = NOW(),
+             expires_at = CASE
+               WHEN $1 = 'APPROVED' AND duration_hours IS NOT NULL
+                 THEN NOW() + (duration_hours || ' hours')::interval
+               ELSE expires_at
+             END
          WHERE id = $3 AND status IN ('PENDING_MANAGER', 'PENDING_ADMIN')
-         RETURNING id, user_id, requested_role_id, status`,
+         RETURNING id, user_id, requested_role_id, status, duration_hours, expires_at`,
         [newStatus, req.user.id, id]
       );
 
@@ -206,11 +241,15 @@ router.put(
       const request = updateResult.rows[0];
 
       if (newStatus === 'APPROVED') {
+        // Same expires_at as just stamped on the access_requests row above,
+        // copied onto the grant itself — user_roles.expires_at is what
+        // checkPermission.js actually enforces against, so the request
+        // record and the live grant always agree on when it lapses.
         await client.query(
-          `INSERT INTO user_roles (user_id, role_id)
-           VALUES ($1, $2)
-           ON CONFLICT (user_id, role_id) DO NOTHING`,
-          [request.user_id, request.requested_role_id]
+          `INSERT INTO user_roles (user_id, role_id, expires_at)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (user_id, role_id) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+          [request.user_id, request.requested_role_id, request.expires_at]
         );
       }
 
@@ -254,6 +293,100 @@ router.put(
       await client.query('ROLLBACK');
       console.error('Error reviewing access request:', err);
       return res.status(500).json({ error: 'Failed to review access request' });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// POST /admin/access-requests/:id/revoke
+// requireAuth + checkPermission('manage_users')
+//
+// Ends an already-APPROVED grant early — e.g. someone's temporary access
+// hasn't hit its expires_at yet but should be cut off now, or a permanent
+// grant needs pulling before the next review cycle. Only acts on a request
+// currently APPROVED; anything else (still pending, already rejected,
+// already revoked) is a 409 rather than silently no-op'ing.
+//
+// user_roles.expires_at is what checkPermission.js actually enforces
+// (`ur.expires_at IS NULL OR ur.expires_at > NOW()`), evaluated at
+// check-time on every request — so stamping it to NOW() here is enough to
+// stop the grant working on the very next permission check. No cron job,
+// no separate "revoked" flag on user_roles to keep in sync.
+router.post(
+  '/admin/access-requests/:id/revoke',
+  requireAuth,
+  checkPermission('manage_users'),
+  async (req, res) => {
+    const { id } = req.params;
+
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      const updateResult = await client.query(
+        `UPDATE access_requests
+         SET status = 'REVOKED'
+         WHERE id = $1 AND status = 'APPROVED'
+         RETURNING id, user_id, requested_role_id, status`,
+        [id]
+      );
+
+      if (updateResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'Only an approved request can be revoked.',
+        });
+      }
+
+      const request = updateResult.rows[0];
+
+      // Expire the live grant immediately. This targets the specific
+      // (user_id, role_id) pair from the request rather than deleting —
+      // deleting would also erase the row's own history (when it was
+      // granted, whether it already had a temporary expires_at from
+      // duration_hours). If the row's somehow already gone (role
+      // reassigned/removed since approval), this just affects 0 rows —
+      // access_requests.status = REVOKED is still the authoritative record.
+      await client.query(
+        `UPDATE user_roles
+         SET expires_at = NOW()
+         WHERE user_id = $1 AND role_id = $2`,
+        [request.user_id, request.requested_role_id]
+      );
+
+      // Same "who/what" lookup as the approve/reject route above, so the
+      // audit log reads as a name + role rather than raw ids.
+      const { rows: contextRows } = await client.query(
+        `SELECT u.name AS user_name, r.name AS role_name
+         FROM users u, roles r
+         WHERE u.id = $1 AND r.id = $2`,
+        [request.user_id, request.requested_role_id]
+      );
+      const requesterName = contextRows[0]?.user_name ?? `user:${request.user_id}`;
+      const roleName = contextRows[0]?.role_name ?? `role:${request.requested_role_id}`;
+
+      // Same actor/target pattern as the rest of this file: user_id is the
+      // admin who revoked it, target_user_id is whose access it was.
+      await client.query(
+        `INSERT INTO audit_logs (user_id, target_user_id, action, resource, ip_address)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [
+          req.user.id,
+          request.user_id,
+          'ADMIN_REVOKED_ACCESS',
+          `access_request:${id} — ${requesterName} (${roleName})`,
+          req.ip,
+        ]
+      );
+
+      await client.query('COMMIT');
+      return res.json(request);
+    } catch (err) {
+      await client.query('ROLLBACK');
+      console.error('Error revoking access request:', err);
+      return res.status(500).json({ error: 'Failed to revoke access request' });
     } finally {
       client.release();
     }
