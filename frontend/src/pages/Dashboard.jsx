@@ -8,6 +8,25 @@ import Header from '../components/Header.jsx';
 // `path` is optional: only set it once a real page exists for the card.
 // Cards without a path keep the old inert "Open →" button rather than
 // linking somewhere that 404s.
+//
+// `role` is new: the single named role (see schema.sql's role_permissions
+// seed) that currently grants this card's permission — 'finance' is the
+// only role granting view_finance_dashboard, 'admin' is the only role
+// granting manage_users, etc. It's used purely to look up that role's
+// expiry for the countdown badge below; it's a frontend-only mapping, not
+// something read from the API. If a permission ever ends up grantable by
+// more than one role, this 1:1 lookup stops being accurate and the expiry
+// would need to come from the backend per-permission instead of per-role.
+//
+// EXPIRY DATA ASSUMPTION: this reads `user.roleExpirations`, a shape that
+// doesn't exist on GET /auth/me yet (today it only returns
+// { id, name, email } — see the note in refreshSession() below). Assumed
+// shape once it's added: `{ [roleName]: expiresAtISOString }`, present
+// only for roles with a non-null user_roles.expires_at (see migration 006)
+// — permanent roles simply have no entry. Everything below degrades
+// gracefully if it's absent: `user.roleExpirations?.[...]` is undefined,
+// useCountdown treats that as "no expiry", cards behave exactly as they
+// do today. Flag to Backend Dev 1 if a different shape is planned.
 const FEATURES = [
   {
     key: 'view_finance_dashboard',
@@ -15,6 +34,7 @@ const FEATURES = [
     description: 'View budgets, expenses, and financial reports.',
     accent: 'bg-emerald-500',
     path: '/dashboard/finance',
+    role: 'finance',
   },
   {
     key: 'view_hr_dashboard',
@@ -22,18 +42,21 @@ const FEATURES = [
     description: 'Employee records, leave requests, and payroll.',
     accent: 'bg-sky-500',
     path: '/dashboard/hr',
+    role: 'hr',
   },
   {
     key: 'manage_users',
     title: 'User Management',
     description: 'Create, edit, and manage user roles.',
     accent: 'bg-violet-500',
+    role: 'admin',
   },
   {
     key: 'view_audit_log',
     title: 'Audit Log',
     description: 'Review permission checks and admin actions.',
     accent: 'bg-amber-500',
+    role: 'admin',
   },
 ];
 
@@ -111,28 +134,101 @@ function DecisionCell({ decision }) {
   );
 }
 
-function FeatureCard({ title, description, accent, enabled, path }) {
+// Ticks every 30s (not every second — this is a badge, not a stopwatch;
+// matches the "refresh every 30s" spec and avoids re-rendering every card
+// every second for no visible benefit at minute-level display precision).
+// `expiresAt` absent/null means a permanent grant — the interval never
+// starts and every call returns the same inert "not active" result.
+const COUNTDOWN_TICK_MS = 30000;
+const COUNTDOWN_RED_THRESHOLD_MS = 5 * 60 * 1000; // under 5 minutes
+const COUNTDOWN_AMBER_THRESHOLD_MS = 60 * 60 * 1000; // under 1 hour
+
+function formatCountdown(msRemaining) {
+  const totalMinutes = Math.floor(msRemaining / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0) return `expires in ${hours}h ${minutes}m`;
+  if (minutes > 0) return `expires in ${minutes}m`;
+  return 'expires in <1m';
+}
+
+function useCountdown(expiresAt) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!expiresAt) return undefined; // permanent — nothing to tick
+    const interval = setInterval(() => setNow(Date.now()), COUNTDOWN_TICK_MS);
+    return () => clearInterval(interval);
+  }, [expiresAt]);
+
+  if (!expiresAt) {
+    return { active: false, expired: false, label: null, tone: 'slate' };
+  }
+
+  const msRemaining = new Date(expiresAt).getTime() - now;
+
+  if (msRemaining <= 0) {
+    return { active: true, expired: true, label: null, tone: 'red' };
+  }
+
+  const tone =
+    msRemaining < COUNTDOWN_RED_THRESHOLD_MS
+      ? 'red'
+      : msRemaining < COUNTDOWN_AMBER_THRESHOLD_MS
+      ? 'amber'
+      : 'slate';
+
+  return { active: true, expired: false, label: formatCountdown(msRemaining), tone };
+}
+
+const COUNTDOWN_BADGE_TONES = {
+  slate: 'bg-slate-100 text-slate-600',
+  amber: 'bg-amber-100 text-amber-700',
+  red: 'bg-rose-100 text-rose-700',
+};
+
+function FeatureCard({ title, description, accent, enabled, path, expiresAt }) {
+  const countdown = useCountdown(expiresAt);
+  // A card can be permission-enabled but locally past its computed expiry
+  // for up to 30s before the next tick / the next session refresh confirms
+  // it server-side — treat that window as already expired rather than
+  // showing a live "Open →" on a grant that's actually timed out.
+  const effectivelyEnabled = enabled && !countdown.expired;
+
   return (
     <div
       className={`relative rounded-xl border p-5 shadow-sm transition ${
-        enabled
+        effectivelyEnabled
           ? 'border-slate-200 bg-white hover:shadow-md hover:-translate-y-0.5'
           : 'border-slate-100 bg-slate-50 opacity-60'
       }`}
     >
+      {effectivelyEnabled && countdown.active && (
+        <span
+          className={`absolute right-4 top-4 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${COUNTDOWN_BADGE_TONES[countdown.tone]}`}
+        >
+          ⏱ {countdown.label}
+        </span>
+      )}
+
       <div className={`h-1.5 w-10 rounded-full ${accent} mb-4`} />
       <h3 className="font-semibold text-slate-800">{title}</h3>
       <p className="mt-1 text-sm text-slate-500">{description}</p>
 
       <div className="mt-4">
-        {enabled && path ? (
+        {countdown.expired ? (
+          <span className="text-xs font-medium text-rose-500">
+            Access expired — request again
+          </span>
+        ) : effectivelyEnabled && path ? (
           <Link
             to={path}
             className="text-sm font-medium text-slate-700 hover:text-slate-900"
           >
             Open →
           </Link>
-        ) : enabled ? (
+        ) : effectivelyEnabled ? (
           <button
             type="button"
             className="text-sm font-medium text-slate-700 hover:text-slate-900"
@@ -210,8 +306,22 @@ function DashboardSkeleton() {
   );
 }
 
+// <select> values are always strings, so 'permanent' is a sentinel rather
+// than using '' (which would be ambiguous with "not yet chosen") or null
+// (which can't be a JSX select value). Converted to a real durationHours
+// number|null right before it's sent — see handleSubmit below.
+const DURATION_OPTIONS = [
+  { value: '4', label: '4 hours' },
+  { value: '24', label: '24 hours' },
+  { value: '168', label: '7 days' },
+  { value: 'permanent', label: 'Permanent' },
+];
+
 function RequestAccessModal({ roles, rolesStatus, onClose, onSubmit, submitting }) {
   const [selectedRoleId, setSelectedRoleId] = useState('');
+  // Defaults to 'permanent' so a request submitted without anyone touching
+  // this field behaves exactly like it did before this control existed.
+  const [duration, setDuration] = useState('permanent');
 
   // roles load asynchronously after the modal opens, so default the
   // selection once they arrive instead of only on mount.
@@ -224,7 +334,8 @@ function RequestAccessModal({ roles, rolesStatus, onClose, onSubmit, submitting 
   const handleSubmit = (e) => {
     e.preventDefault();
     const role = roles.find((r) => String(r.id) === String(selectedRoleId));
-    onSubmit(role);
+    const durationHours = duration === 'permanent' ? null : Number(duration);
+    onSubmit(role, durationHours);
   };
 
   const canSubmit = rolesStatus === 'ready' && roles.length > 0;
@@ -294,6 +405,24 @@ function RequestAccessModal({ roles, rolesStatus, onClose, onSubmit, submitting 
               </select>
             </div>
           )}
+
+          <div>
+            <label htmlFor="duration" className="block text-sm font-medium text-slate-700">
+              Duration
+            </label>
+            <select
+              id="duration"
+              value={duration}
+              onChange={(e) => setDuration(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500"
+            >
+              {DURATION_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
 
           <div className="flex justify-end gap-2 pt-2">
             <button
@@ -443,13 +572,13 @@ export default function Dashboard() {
     }
   };
 
-  const handleRequestSubmit = async (role) => {
+  const handleRequestSubmit = async (role, durationHours) => {
     if (!role) return;
 
     setSubmitting(true);
 
     try {
-      await requestAccess(role.id);
+      await requestAccess(role.id, durationHours);
       setModalOpen(false);
       setToast({
         type: 'success',
@@ -517,6 +646,7 @@ export default function Dashboard() {
               accent={feature.accent}
               enabled={user.permissions.includes(feature.key)}
               path={feature.path}
+              expiresAt={user.roleExpirations?.[feature.role]}
             />
           ))}
         </div>
